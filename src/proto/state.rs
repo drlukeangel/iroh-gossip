@@ -419,4 +419,97 @@ mod tests {
             "PeerDisconnected must prune the peer from peer_topics"
         );
     }
+
+    type S = State<u32, StdRng>;
+
+    fn node(id: u32) -> S {
+        State::new(
+            id,
+            PeerData::new(Vec::<u8>::new()),
+            Config::default(),
+            StdRng::seed_from_u64(id as u64),
+        )
+    }
+
+    fn topic(n: u8) -> TopicId {
+        TopicId::from_bytes([n; 32])
+    }
+
+    fn feed(s: &mut S, ev: InEvent<u32>) -> Vec<OutEvent<u32>> {
+        s.handle(ev, Instant::now(), None).collect()
+    }
+
+    /// Ferry every `SendMessage` between `a` (id 1) and `b` (id 2) until both are quiet, and
+    /// return every event each side emitted while doing so. Timers are not fired.
+    fn settle(
+        a: &mut S,
+        b: &mut S,
+        mut from_a: Vec<OutEvent<u32>>,
+        mut from_b: Vec<OutEvent<u32>>,
+    ) -> (Vec<OutEvent<u32>>, Vec<OutEvent<u32>>) {
+        let (mut seen_a, mut seen_b) = (vec![], vec![]);
+        while !from_a.is_empty() || !from_b.is_empty() {
+            let (mut next_a, mut next_b) = (vec![], vec![]);
+            for ev in from_a.drain(..) {
+                if let OutEvent::SendMessage(2, msg) = &ev {
+                    next_b.extend(feed(b, InEvent::RecvMessage(1, msg.clone())));
+                }
+                seen_a.push(ev);
+            }
+            for ev in from_b.drain(..) {
+                if let OutEvent::SendMessage(1, msg) = &ev {
+                    next_a.extend(feed(a, InEvent::RecvMessage(2, msg.clone())));
+                }
+                seen_b.push(ev);
+            }
+            from_a = next_a;
+            from_b = next_b;
+        }
+        (seen_a, seen_b)
+    }
+
+    fn joined_pair(topics: &[TopicId]) -> (S, S) {
+        let (mut a, mut b) = (node(1), node(2));
+        let (mut oa, mut ob) = (vec![], vec![]);
+        for t in topics {
+            oa.extend(feed(&mut a, InEvent::Command(*t, Command::Join(vec![2]))));
+            ob.extend(feed(&mut b, InEvent::Command(*t, Command::Join(vec![1]))));
+        }
+        settle(&mut a, &mut b, oa, ob);
+        (a, b)
+    }
+
+    fn has(events: &[OutEvent<u32>], f: impl Fn(&OutEvent<u32>) -> bool) -> bool {
+        events.iter().any(f)
+    }
+
+    /// A peer quitting one topic must not close the connection that other topics still use, on
+    /// either side; when the connection then closes, every remaining topic sees the peer go.
+    #[test]
+    fn quit_of_one_topic_keeps_the_connection_other_topics_use() {
+        let (t1, t2) = (topic(1), topic(2));
+        let (mut a, mut b) = joined_pair(&[t1, t2]);
+
+        let quit = feed(&mut a, InEvent::Command(t1, Command::Quit));
+        assert!(
+            !has(&quit, |e| matches!(e, OutEvent::DisconnectPeer(2))),
+            "A quitting T1 must not disconnect B while T2 still uses the connection: {quit:?}"
+        );
+        let (_, seen_b) = settle(&mut a, &mut b, quit, vec![]);
+        assert!(
+            !has(&seen_b, |e| matches!(e, OutEvent::DisconnectPeer(1))),
+            "B dropping A from T1 must not disconnect A while T2 still uses the connection: {seen_b:?}"
+        );
+        assert!(
+            !has(&seen_b, |e| matches!(e, OutEvent::EmitEvent(t, topic::Event::NeighborDown(1)) if *t == t2)),
+            "B must still hold A as a T2 neighbour"
+        );
+
+        // The connection now closes: T2 on B must hear PeerDisconnected and drop A.
+        let closed = feed(&mut b, InEvent::PeerDisconnected(1));
+        assert!(
+            has(&closed, |e| matches!(e, OutEvent::EmitEvent(t, topic::Event::NeighborDown(1)) if *t == t2)),
+            "PeerDisconnected must reach T2 on B and drop A: {closed:?}"
+        );
+    }
 }
