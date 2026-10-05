@@ -8,6 +8,9 @@ use iroh_metrics::{Counter, MetricsGroup};
 pub struct Metrics {
     /// Number of control messages sent
     pub msgs_ctrl_sent: Counter,
+    /// Number of messages not enqueued because a peer's send queue was full
+    /// (the actor never waits on one peer; Plumtree repairs the loss)
+    pub msgs_dropped_send_queue_full: Counter,
     /// Number of control messages received
     pub msgs_ctrl_recv: Counter,
     /// Number of data messages sent

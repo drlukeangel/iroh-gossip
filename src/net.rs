@@ -687,13 +687,29 @@ impl Actor {
                     let state = self.peers.entry(peer_id).or_default();
                     match state {
                         PeerState::Active { active_send_tx, .. } => {
-                            if let Err(_err) = active_send_tx.send(message).await {
-                                // Removing the peer is handled by the in_event PeerDisconnected sent
-                                // in [`Self::handle_connection_task_finished`].
-                                warn!(
-                                    peer = %peer_id.fmt_short(),
-                                    "failed to send: connection task send loop terminated",
-                                );
+                            // Never await one peer's queue: a peer whose connection
+                            // stopped draining would stop this actor, deafening every
+                            // topic, and two actors saturating each other would
+                            // deadlock. A full queue loses this one enqueue to this
+                            // one peer; Plumtree's lazy push and graft repair it.
+                            use tokio::sync::mpsc::error::TrySendError;
+                            match active_send_tx.try_send(message) {
+                                Ok(()) => {}
+                                Err(TrySendError::Full(_)) => {
+                                    self.metrics.msgs_dropped_send_queue_full.inc();
+                                    debug!(
+                                        peer = %peer_id.fmt_short(),
+                                        "send queue full, dropping message",
+                                    );
+                                }
+                                Err(TrySendError::Closed(_)) => {
+                                    // Removing the peer is handled by the in_event PeerDisconnected sent
+                                    // in [`Self::handle_connection_task_finished`].
+                                    warn!(
+                                        peer = %peer_id.fmt_short(),
+                                        "failed to send: connection task send loop terminated",
+                                    );
+                                }
                             }
                         }
                         PeerState::Pending { queue } => {
@@ -1688,20 +1704,44 @@ pub(crate) mod tests {
         let sent = live_rx.try_recv().expect("the live peer received its join");
         assert_eq!(sent.topic, t2);
 
-        // Only the one enqueue was lost: the stalled queue holds what it held.
+        // Only the one enqueue was lost: the stalled queue holds what it held,
+        // and the loss is counted.
         assert_eq!(stalled_tx.capacity(), 0);
+        assert_eq!(actor.metrics.msgs_dropped_send_queue_full.get(), 1);
         drop(stalled_rx);
         cancel.cancel();
         Ok(())
     }
 
     /// Two actors flooding each other on one topic saturate each other's
-    /// per-peer send queues. Neither may go deaf: both keep receiving a third
-    /// peer's messages on other topics throughout, and after the flood one
-    /// message sent once on the flooded topic still converges (ordinary
-    /// delivery or Plumtree repair through the third peer; nothing resends).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn reciprocal_send_queue_saturation_never_makes_both_actors_deaf() {
+    /// per-peer send queues. Neither may go deaf: each keeps taking commands
+    /// for the whole flood, each hears a third peer's messages on another
+    /// topic again right after it, and one message sent once on the flooded
+    /// topic still converges (ordinary delivery or Plumtree repair through the
+    /// third peer; nothing resends). Deafness is permanent: with the blocking
+    /// send the actors stop taking commands within about a second.
+    ///
+    /// The flood runs with tracing off on every runtime thread: a TRACE
+    /// subscriber that another test installed globally would otherwise
+    /// serialize the actors on logging and time out the probes.
+    #[test]
+    fn reciprocal_send_queue_saturation_never_makes_both_actors_deaf() {
+        let quiet = || {
+            std::mem::forget(tracing::subscriber::set_default(
+                tracing::subscriber::NoSubscriber::default(),
+            ))
+        };
+        quiet();
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .on_thread_start(quiet)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(reciprocal_flood());
+    }
+
+    async fn reciprocal_flood() {
         let mut rng = rand::rngs::ChaCha12Rng::seed_from_u64(11);
         let (relay_map, relay_url, _guard) = iroh::test_utils::run_relay_server().await.unwrap();
         let lookup = MemoryLookup::new();
@@ -1799,6 +1839,7 @@ pub(crate) mod tests {
             spawn(async move {
                 let until = Instant::now() + flood_for;
                 let mut n = 0u64;
+                let mut stalled = false;
                 while Instant::now() < until {
                     let mut m = payload.to_vec();
                     m.extend_from_slice(&n.to_be_bytes());
@@ -1807,32 +1848,50 @@ pub(crate) mod tests {
                         .is_err()
                     {
                         // The local actor no longer takes commands.
+                        stalled = true;
                         break;
                     }
                     n += 1;
                 }
-                (n, tx)
+                (n, tx, stalled)
             })
         };
-        let started = Instant::now();
         let (fa, fb) = (flood(a1_tx, payload.clone()), flood(b1_tx, payload));
         let (fa, fb) = (fa.await.unwrap(), fb.await.unwrap());
-        let window = (started + Duration::from_secs(1), started + flood_for);
-        let during = |seen: &Arc<std::sync::Mutex<Vec<Instant>>>| {
-            seen.lock()
-                .unwrap()
-                .iter()
-                .filter(|t| **t >= window.0 && **t <= window.1)
-                .count()
-        };
         assert!(
-            during(&a_probes) > 0,
-            "A went deaf while flooding and being flooded ({} sent)",
+            !fa.2,
+            "A's actor stopped taking commands after {} broadcasts",
             fa.0
         );
         assert!(
-            during(&b_probes) > 0,
-            "B went deaf while flooding and being flooded ({} sent)",
+            !fb.2,
+            "B's actor stopped taking commands after {} broadcasts",
+            fb.0
+        );
+        // Deafness is permanent; lateness behind the flood is not deafness.
+        let flood_end = Instant::now();
+        let heard_after = |seen: Arc<std::sync::Mutex<Vec<Instant>>>| async move {
+            // The backlog of the flood (and of C's forwards) drains through
+            // one shared relay first; permanence is what this rules out.
+            timeout(Duration::from_secs(20), async {
+                loop {
+                    if seen.lock().unwrap().iter().any(|t| *t > flood_end) {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .is_ok()
+        };
+        assert!(
+            heard_after(a_probes).await,
+            "A is deaf after the flood ({} sent)",
+            fa.0
+        );
+        assert!(
+            heard_after(b_probes).await,
+            "B is deaf after the flood ({} sent)",
             fb.0
         );
 
