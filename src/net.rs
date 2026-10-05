@@ -669,6 +669,10 @@ impl Actor {
         }
     }
 
+    #[allow(
+        clippy::unused_async,
+        reason = "stays a future so the send-queue regression can bound it with a timeout"
+    )]
     async fn handle_in_event_inner(&mut self, event: InEvent, now: Instant) {
         if matches!(event, InEvent::TimerExpired(_)) {
             trace!(?event, "handle in_event");
