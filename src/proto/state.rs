@@ -323,7 +323,10 @@ fn handle_out_event<PI: PeerIdentity>(
         topic::OutEvent::DisconnectPeer(peer) => {
             let empty = conns
                 .get_mut(&peer)
-                .map(|list| { list.remove(&topic); list.is_empty() })
+                .map(|list| {
+                    list.remove(&topic);
+                    list.is_empty()
+                })
                 .unwrap_or(false);
             if empty {
                 conns.remove(&peer);
@@ -501,14 +504,20 @@ mod tests {
             "B dropping A from T1 must not disconnect A while T2 still uses the connection: {seen_b:?}"
         );
         assert!(
-            !has(&seen_b, |e| matches!(e, OutEvent::EmitEvent(t, topic::Event::NeighborDown(1)) if *t == t2)),
+            !has(
+                &seen_b,
+                |e| matches!(e, OutEvent::EmitEvent(t, topic::Event::NeighborDown(1)) if *t == t2)
+            ),
             "B must still hold A as a T2 neighbour"
         );
 
         // The connection now closes: T2 on B must hear PeerDisconnected and drop A.
         let closed = feed(&mut b, InEvent::PeerDisconnected(1));
         assert!(
-            has(&closed, |e| matches!(e, OutEvent::EmitEvent(t, topic::Event::NeighborDown(1)) if *t == t2)),
+            has(
+                &closed,
+                |e| matches!(e, OutEvent::EmitEvent(t, topic::Event::NeighborDown(1)) if *t == t2)
+            ),
             "PeerDisconnected must reach T2 on B and drop A: {closed:?}"
         );
     }

@@ -1562,8 +1562,7 @@ pub(crate) mod tests {
     #[traced_test]
     async fn send_loop_terminates_when_send_channel_closed() -> Result {
         let rng = &mut rand::rngs::ChaCha12Rng::seed_from_u64(1);
-        let (relay_map, relay_url, _guard) =
-            iroh::test_utils::run_relay_server().await.unwrap();
+        let (relay_map, relay_url, _guard) = iroh::test_utils::run_relay_server().await.unwrap();
         let ep1 = create_endpoint(rng, relay_map.clone(), None).await?;
         let ep2 = create_endpoint(rng, relay_map.clone(), None).await?;
 
@@ -1601,9 +1600,98 @@ pub(crate) mod tests {
             res.is_ok(),
             "SendLoop must terminate when its send channel closes (superseded connection)"
         );
-        res.expect("send loop returned").std_context("send loop run")?;
+        res.expect("send loop returned")
+            .std_context("send loop run")?;
 
         accept_task.abort();
+        Ok(())
+    }
+
+    /// An active peer whose connection stopped draining (its per-peer send queue
+    /// is full) must never stop the net actor: one actor awaiting one peer's
+    /// queue goes deaf on every topic, and two actors doing it to each other
+    /// deadlock (rafka i143.e4.s12). The enqueue to that peer is lost; the actor
+    /// carries on and serves every other peer.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_full_peer_send_queue_never_blocks_the_actor() -> Result {
+        let rng = &mut rand::rngs::ChaCha12Rng::seed_from_u64(7);
+        let (relay_map, _relay_url, _guard) = iroh::test_utils::run_relay_server().await.unwrap();
+        let cancel = CancellationToken::new();
+        let (_gossip, mut actor, _ep_task) =
+            Gossip::t_new_with_actor(rng, Default::default(), relay_map, &cancel).await?;
+
+        // A live peer with room; the join the actor sends it is the filler below.
+        let live = SecretKey::from_bytes(&rng.random()).public();
+        let (live_tx, mut live_rx) = mpsc::channel::<ProtoMessage>(SEND_QUEUE_CAP);
+        actor.peers.insert(
+            live,
+            PeerState::Active {
+                active_send_tx: live_tx,
+                active_conn_id: 2,
+                other_conns: vec![],
+            },
+        );
+        let t0 = TopicId::from_bytes([3; 32]);
+        actor
+            .handle_in_event_inner(
+                InEvent::Command(t0, proto::Command::Join(vec![live])),
+                Instant::now(),
+            )
+            .await;
+        let filler = live_rx.try_recv().expect("the live peer received its join");
+
+        // A stalled peer: active, its queue full, never drained.
+        let stalled = SecretKey::from_bytes(&rng.random()).public();
+        let (stalled_tx, stalled_rx) = mpsc::channel::<ProtoMessage>(SEND_QUEUE_CAP);
+        for _ in 0..SEND_QUEUE_CAP {
+            stalled_tx.try_send(filler.clone()).expect("room");
+        }
+        actor.peers.insert(
+            stalled,
+            PeerState::Active {
+                active_send_tx: stalled_tx.clone(),
+                active_conn_id: 1,
+                other_conns: vec![],
+            },
+        );
+
+        // Joining a topic through the stalled peer enqueues to it.
+        let t1 = TopicId::from_bytes([1; 32]);
+        let to_stalled = timeout(
+            Duration::from_secs(2),
+            actor.handle_in_event_inner(
+                InEvent::Command(t1, proto::Command::Join(vec![stalled])),
+                Instant::now(),
+            ),
+        )
+        .await;
+        assert!(
+            to_stalled.is_ok(),
+            "the actor awaited capacity on one peer's full send queue"
+        );
+
+        // The actor still serves another peer and topic.
+        let t2 = TopicId::from_bytes([2; 32]);
+        let to_live = timeout(
+            Duration::from_secs(2),
+            actor.handle_in_event_inner(
+                InEvent::Command(t2, proto::Command::Join(vec![live])),
+                Instant::now(),
+            ),
+        )
+        .await;
+        assert!(
+            to_live.is_ok(),
+            "the actor stopped after one peer's queue filled"
+        );
+        let sent = live_rx.try_recv().expect("the live peer received its join");
+        assert_eq!(sent.topic, t2);
+
+        // Only the one enqueue was lost: the stalled queue holds what it held.
+        assert_eq!(stalled_tx.capacity(), 0);
+        drop(stalled_rx);
+        cancel.cancel();
         Ok(())
     }
 
