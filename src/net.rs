@@ -1717,6 +1717,49 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// A peer whose connection task ended (its send queue is Closed) keeps its
+    /// existing handling: the send is neither awaited nor counted as a
+    /// full-queue drop, and the peer is not removed inline. Its removal stays
+    /// with the connection task's finish (`handle_connection_task_finished`,
+    /// exercised end to end by the reconnect tests).
+    #[tokio::test]
+    async fn a_closed_peer_send_queue_keeps_its_disconnect_cleanup() -> Result {
+        let rng = &mut rand::rngs::ChaCha12Rng::seed_from_u64(9);
+        let (relay_map, _relay_url, _guard) = iroh::test_utils::run_relay_server().await.unwrap();
+        let cancel = CancellationToken::new();
+        let (_gossip, mut actor, _ep_task) =
+            Gossip::t_new_with_actor(rng, Default::default(), relay_map, &cancel).await?;
+
+        let gone = SecretKey::from_bytes(&rng.random()).public();
+        let (gone_tx, gone_rx) = mpsc::channel::<ProtoMessage>(SEND_QUEUE_CAP);
+        drop(gone_rx);
+        actor.peers.insert(
+            gone,
+            PeerState::Active {
+                active_send_tx: gone_tx,
+                active_conn_id: 1,
+                other_conns: vec![],
+            },
+        );
+        let t = TopicId::from_bytes([4; 32]);
+        let sent = timeout(
+            Duration::from_secs(2),
+            actor.handle_in_event_inner(
+                InEvent::Command(t, proto::Command::Join(vec![gone])),
+                Instant::now(),
+            ),
+        )
+        .await;
+        assert!(sent.is_ok(), "the actor stopped on a closed send queue");
+        assert_eq!(actor.metrics.msgs_dropped_send_queue_full.get(), 0);
+        assert!(
+            matches!(actor.peers.get(&gone), Some(PeerState::Active { .. })),
+            "a closed queue is cleaned up by the connection task's finish, not inline"
+        );
+        cancel.cancel();
+        Ok(())
+    }
+
     /// Two actors flooding each other on one topic saturate each other's
     /// per-peer send queues. Neither may go deaf: each keeps taking commands
     /// for the whole flood, each hears a third peer's messages on another
