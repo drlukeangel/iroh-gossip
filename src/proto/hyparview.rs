@@ -857,6 +857,39 @@ mod tests {
         );
     }
 
+    // A Join proves the sender holds no state for us. A peer that restarts under the same
+    // identity sends a fresh Join while our active view and our pending-neighbor set still hold
+    // the previous incarnation: the Join must still be answered with exactly one Neighbor, and
+    // the pending entry is then the expectation of the new handshake.
+    #[test]
+    fn join_from_active_peer_with_stale_pending_is_answered_with_one_neighbor() {
+        let mut state = state();
+        let mut io = VecDeque::<TopicOut<u32>>::new();
+        let peer = 7;
+        state.active_view.insert(peer);
+        state.pending_neighbor_requests.insert(peer);
+        state.handle(
+            InEvent::RecvMessage(peer, Message::Join(None)),
+            &mut io,
+        );
+        let neighbors = io
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    TopicOut::SendMessage(to, crate::proto::topic::Message::Swarm(Message::Neighbor(_)))
+                        if *to == peer
+                )
+            })
+            .count();
+        assert_eq!(neighbors, 1, "exactly one Neighbor answers the Join: {io:?}");
+        assert!(
+            state.pending_neighbor_requests.contains(&peer),
+            "the new handshake's expectation is pending"
+        );
+        assert!(state.active_view.contains(&peer));
+    }
+
     #[test]
     fn pending_neighbor_timeout_prunes_metadata() {
         let mut state = state();
