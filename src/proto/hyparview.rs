@@ -398,6 +398,9 @@ where
         );
         // "A node that receives a join request will start by adding the new
         // node to its active view, even if it has to drop a random node from it. (6)"
+        // A Join proves the sender holds no state for us, so any pending-neighbor entry for it
+        // belongs to a previous incarnation: drop it so the Neighbor reply below is queued.
+        self.pending_neighbor_requests.remove(&peer);
         self.add_active(peer, data.clone(), Priority::High, true, io);
 
         // "The contact node c will then send to all other nodes in its active view a ForwardJoin
