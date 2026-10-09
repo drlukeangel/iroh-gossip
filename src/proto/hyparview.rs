@@ -893,6 +893,177 @@ mod tests {
         assert!(state.active_view.contains(&peer));
     }
 
+    // R-G5: `pending_neighbor_requests` holds exactly the Neighbor requests we solicited and have
+    // not yet had answered. A Neighbor we send as the terminal answer to someone else's request
+    // registers nothing.
+
+    type Io = VecDeque<TopicOut<u32>>;
+
+    fn neighbors_to(io: &Io, to: u32) -> usize {
+        io.iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    TopicOut::SendMessage(p, crate::proto::topic::Message::Swarm(Message::Neighbor(_)))
+                        if *p == to
+                )
+            })
+            .count()
+    }
+
+    fn forward_joins(io: &Io) -> usize {
+        io.iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    TopicOut::SendMessage(_, crate::proto::topic::Message::Swarm(Message::ForwardJoin(_)))
+                )
+            })
+            .count()
+    }
+
+    /// Deliver every message `a` and `b` send each other until both are quiet; returns the number
+    /// of Neighbor messages that crossed the wire.
+    fn settle(a: &mut State<u32, StdRng>, b: &mut State<u32, StdRng>, mut io: Io) -> usize {
+        let (ia, ib) = (a.me, b.me);
+        let mut neighbors = 0;
+        for _ in 0..16 {
+            let sent: Vec<_> = io
+                .drain(..)
+                .filter_map(|e| match e {
+                    TopicOut::SendMessage(to, crate::proto::topic::Message::Swarm(m)) => Some((to, m)),
+                    _ => None,
+                })
+                .collect();
+            if sent.is_empty() {
+                return neighbors;
+            }
+            for (to, m) in sent {
+                if matches!(m, Message::Neighbor(_)) {
+                    neighbors += 1;
+                }
+                let (target, from) = if to == ia { (&mut *a, ib) } else { (&mut *b, ia) };
+                target.handle(InEvent::RecvMessage(from, m), &mut io);
+            }
+        }
+        panic!("the handshake did not settle");
+    }
+
+    fn pair() -> (State<u32, StdRng>, State<u32, StdRng>) {
+        let a = State::new(1u32, None, Config::default(), StdRng::seed_from_u64(1));
+        let b = State::new(2u32, None, Config::default(), StdRng::seed_from_u64(2));
+        (a, b)
+    }
+
+    #[test]
+    fn unsolicited_neighbor_is_answered_terminally_and_both_sides_end_clean() {
+        let (mut a, mut b) = pair();
+        let mut io = Io::new();
+        a.send_neighbor(2, Priority::High, &mut io);
+        assert!(a.pending_neighbor_requests.contains(&2), "the solicitation is pending");
+        let sent = settle(&mut a, &mut b, io);
+        assert_eq!(sent, 2, "the request and one terminal answer");
+        assert!(a.pending_neighbor_requests.is_empty(), "A cleared on the answer");
+        assert!(b.pending_neighbor_requests.is_empty(), "the terminal answer registered nothing on B");
+        assert!(a.active_view.contains(&2) && b.active_view.contains(&1));
+    }
+
+    #[test]
+    fn join_handshake_leaves_no_pending_on_either_side() {
+        let (mut a, mut b) = pair();
+        let mut io = Io::new();
+        b.handle(InEvent::RequestJoin(1), &mut io);
+        let sent = settle(&mut a, &mut b, io);
+        assert_eq!(sent, 2, "the contact solicits once, the joiner answers once");
+        assert!(a.pending_neighbor_requests.is_empty(), "contact cleared");
+        assert!(b.pending_neighbor_requests.is_empty(), "joiner registered nothing");
+        assert!(a.active_view.contains(&2) && b.active_view.contains(&1));
+    }
+
+    #[test]
+    fn crossed_requests_clear_both_sides_with_no_extra_message() {
+        let (mut a, mut b) = pair();
+        let mut io = Io::new();
+        a.send_neighbor(2, Priority::High, &mut io);
+        b.send_neighbor(1, Priority::High, &mut io);
+        let sent = settle(&mut a, &mut b, io);
+        assert_eq!(sent, 2, "only the two crossed requests");
+        assert!(a.pending_neighbor_requests.is_empty());
+        assert!(b.pending_neighbor_requests.is_empty());
+    }
+
+    // `on_forward_join` forwards a walk onward only when the peer is neither active nor pending
+    // (hyparview.rs `!self.pending_neighbor_requests.contains(&peer_id)`). A Neighbor answered
+    // terminally must not leave a pending entry that later silences the walk.
+    #[test]
+    fn forward_join_is_not_suppressed_by_an_entry_left_by_a_terminal_answer() {
+        let mut s = state();
+        let mut io = Io::new();
+        for p in [100, 101, 102] {
+            s.active_view.insert(p);
+        }
+        // Peer 7 asks for a neighbor, is answered, and is then evicted from the active view.
+        s.handle(
+            InEvent::RecvMessage(
+                7,
+                Message::Neighbor(Neighbor { priority: Priority::High, data: None }),
+            ),
+            &mut io,
+        );
+        assert_eq!(neighbors_to(&io, 7), 1);
+        s.remove_active(&7, RemovalReason::Random, &mut io);
+        assert!(!s.active_view.contains(&7));
+        io.clear();
+        s.handle(
+            InEvent::RecvMessage(
+                100,
+                Message::ForwardJoin(ForwardJoin {
+                    peer: PeerInfo { id: 7, data: None },
+                    ttl: s.config.active_random_walk_length,
+                }),
+            ),
+            &mut io,
+        );
+        assert_eq!(forward_joins(&io), 1, "the walk for peer 7 is forwarded: {io:?}");
+    }
+
+    // `refill_active_from_passive` counts `active + pending` against the capacity
+    // (hyparview.rs `self.active_view.len() + self.pending_neighbor_requests.len() >= capacity`).
+    #[test]
+    fn refill_courts_a_passive_candidate_and_registers_the_request() {
+        let mut s = state();
+        let mut io = Io::new();
+        s.passive_view.insert(10);
+        s.refill_active_from_passive(&[], &mut io);
+        assert_eq!(neighbors_to(&io, 10), 1);
+        assert!(s.pending_neighbor_requests.contains(&10));
+    }
+
+    #[test]
+    fn answering_an_unsolicited_neighbor_does_not_stop_the_refill_of_a_free_slot() {
+        let mut s = state();
+        let cap = s.config.active_view_capacity;
+        let mut io = Io::new();
+        // capacity - 1 active peers, one of which (7) renews with an unsolicited Neighbor.
+        for p in 0..(cap as u32 - 2) {
+            s.active_view.insert(100 + p);
+        }
+        s.active_view.insert(7);
+        assert_eq!(s.active_view.len(), cap - 1);
+        s.passive_view.insert(10);
+        s.handle(
+            InEvent::RecvMessage(
+                7,
+                Message::Neighbor(Neighbor { priority: Priority::Low, data: None }),
+            ),
+            &mut io,
+        );
+        assert_eq!(neighbors_to(&io, 7), 1, "the renewal is answered");
+        io.clear();
+        s.refill_active_from_passive(&[], &mut io);
+        assert_eq!(neighbors_to(&io, 10), 1, "the free slot is still courted: {io:?}");
+    }
+
     #[test]
     fn pending_neighbor_timeout_prunes_metadata() {
         let mut state = state();
