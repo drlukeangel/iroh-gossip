@@ -398,10 +398,8 @@ where
         );
         // "A node that receives a join request will start by adding the new
         // node to its active view, even if it has to drop a random node from it. (6)"
-        // A Join proves the sender holds no state for us, so any pending-neighbor entry for it
-        // belongs to a previous incarnation: drop it so the Neighbor reply below is queued.
-        self.pending_neighbor_requests.remove(&peer);
-        self.add_active(peer, data.clone(), Priority::High, true, io);
+        // The contact solicits: the joiner's terminal Neighbor answers it.
+        self.add_active(peer, data.clone(), Priority::High, Reply::Solicit, io);
 
         // "The contact node c will then send to all other nodes in its active view a ForwardJoin
         // request containing the new node identifier. Associated to the join procedure,
@@ -426,7 +424,7 @@ where
         // If the peer is already in our active view, we renew our neighbor relationship.
         if self.active_view.contains(&peer_id) {
             self.insert_peer_info(message.peer, io);
-            self.send_neighbor(peer_id, Priority::High, io);
+            self.send_neighbor(peer_id, Priority::High, Reply::Solicit, io);
         }
         // "i) If the time to live is equal to zero or if the number of nodes in p’s active view is equal to one,
         // it will add the new node to its active view (7)"
@@ -436,7 +434,7 @@ where
             // we only send the Neighbor message. We will add the peer to our active view once we receive a
             // reply from our neighbor.
             // This prevents us adding unreachable peers to our active view.
-            self.send_neighbor(peer_id, Priority::High, io);
+            self.send_neighbor(peer_id, Priority::High, Reply::Solicit, io);
         } else {
             // "ii) If the time to live is equal to PRWL, p will insert the new node into its passive view"
             if message.ttl == self.config.passive_random_walk_length {
@@ -483,12 +481,14 @@ where
             "rg3 on_neighbor (is_reply = pending_neighbor)"
         );
         let is_reply = self.pending_neighbor_requests.remove(&from);
-        let do_reply = !is_reply;
+        // A Neighbor that answers our own request ends the handshake. An unsolicited one is
+        // answered once, terminally.
+        let reply = if is_reply { Reply::None } else { Reply::Terminal };
         // "A node q that receives a high priority neighbor request will always accept the request, even
         // if it has to drop a random member from its active view (again, the member that is dropped will
         // receive a Disconnect notification). If a node q receives a low priority Neighbor request, it will
         // only accept the request if it has a free slot in its active view, otherwise it will refuse the request."
-        if !self.add_active(from, details.data, details.priority, do_reply, io) {
+        if !self.add_active(from, details.data, details.priority, reply, io) {
             self.send_disconnect(from, true, io);
         }
     }
@@ -657,7 +657,7 @@ where
                 true => Priority::High,
                 false => Priority::Low,
             };
-            self.send_neighbor(node, priority, io);
+            self.send_neighbor(node, priority, Reply::Solicit, io);
             // schedule a timer that checks if the node replied with a neighbor message,
             // otherwise try again with another passive node.
             io.push(OutEvent::ScheduleTimer(
@@ -746,7 +746,7 @@ where
         peer: PI,
         data: Option<PeerData>,
         priority: Priority,
-        reply: bool,
+        reply: Reply,
         io: &mut impl IO<PI>,
     ) -> bool {
         if peer == self.me {
@@ -754,9 +754,7 @@ where
         }
         self.insert_peer_info((peer, data).into(), io);
         if self.active_view.contains(&peer) {
-            if reply {
-                self.send_neighbor(peer, priority, io);
-            }
+            self.send_neighbor(peer, priority, reply, io);
             return true;
         }
         match (priority, self.active_is_full()) {
@@ -779,37 +777,51 @@ where
         &mut self,
         peer: PI,
         priority: Priority,
-        reply: bool,
+        reply: Reply,
         io: &mut impl IO<PI>,
     ) {
         self.passive_view.remove(&peer);
         if self.active_view.insert(peer) {
             debug!(other = ?peer, "add to active view");
             io.push(OutEvent::EmitEvent(Event::NeighborUp(peer)));
-            if reply {
-                self.send_neighbor(peer, priority, io);
-            }
+            self.send_neighbor(peer, priority, reply, io);
         }
     }
 
-    fn send_neighbor(&mut self, peer: PI, priority: Priority, io: &mut impl IO<PI>) {
-        let already_pending = self.pending_neighbor_requests.contains(&peer);
+    /// The one place a Neighbor message is sent. `mode` says whether it asks for an answer.
+    fn send_neighbor(&mut self, peer: PI, priority: Priority, mode: Reply, io: &mut impl IO<PI>) {
         debug!(
             target: "rg3",
-            me = ?self.me, to = ?peer, priority = ?priority,
+            me = ?self.me, to = ?peer, priority = ?priority, mode = ?mode,
             in_active = self.active_view.contains(&peer),
-            pending_neighbor = already_pending,
-            queued = !already_pending,
+            pending_neighbor = self.pending_neighbor_requests.contains(&peer),
+            queued = mode != Reply::None,
             "rg3 send_neighbor"
         );
-        if self.pending_neighbor_requests.insert(peer) {
-            let message = Message::Neighbor(Neighbor {
-                priority,
-                data: self.me_data.clone(),
-            });
-            io.push(OutEvent::SendMessage(peer, message));
+        match mode {
+            Reply::None => return,
+            Reply::Solicit => {
+                self.pending_neighbor_requests.insert(peer);
+            }
+            Reply::Terminal => {}
         }
+        let message = Message::Neighbor(Neighbor {
+            priority,
+            data: self.me_data.clone(),
+        });
+        io.push(OutEvent::SendMessage(peer, message));
     }
+}
+
+/// What a Neighbor sent while adding a peer to the active view does about the peer's answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reply {
+    /// No Neighbor is sent: the message being handled was itself the answer.
+    None,
+    /// A Neighbor is sent and registered in `pending_neighbor_requests`: it asks for an answer.
+    Solicit,
+    /// A Neighbor is sent and nothing is registered: it is the answer, and ends the handshake.
+    Terminal,
 }
 
 #[derive(Debug)]
@@ -959,7 +971,7 @@ mod tests {
     fn unsolicited_neighbor_is_answered_terminally_and_both_sides_end_clean() {
         let (mut a, mut b) = pair();
         let mut io = Io::new();
-        a.send_neighbor(2, Priority::High, &mut io);
+        a.send_neighbor(2, Priority::High, Reply::Solicit, &mut io);
         assert!(a.pending_neighbor_requests.contains(&2), "the solicitation is pending");
         let sent = settle(&mut a, &mut b, io);
         assert_eq!(sent, 2, "the request and one terminal answer");
@@ -984,8 +996,8 @@ mod tests {
     fn crossed_requests_clear_both_sides_with_no_extra_message() {
         let (mut a, mut b) = pair();
         let mut io = Io::new();
-        a.send_neighbor(2, Priority::High, &mut io);
-        b.send_neighbor(1, Priority::High, &mut io);
+        a.send_neighbor(2, Priority::High, Reply::Solicit, &mut io);
+        b.send_neighbor(1, Priority::High, Reply::Solicit, &mut io);
         let sent = settle(&mut a, &mut b, io);
         assert_eq!(sent, 2, "only the two crossed requests");
         assert!(a.pending_neighbor_requests.is_empty());
