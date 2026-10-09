@@ -344,6 +344,13 @@ where
 
     /// A connection was closed by the peer.
     fn handle_connection_closed(&mut self, peer: PI, io: &mut impl IO<PI>) {
+        debug!(
+            target: "rg3",
+            me = ?self.me, peer = ?peer,
+            in_active = self.active_view.contains(&peer),
+            pending_neighbor = self.pending_neighbor_requests.contains(&peer),
+            "rg3 connection_closed"
+        );
         self.pending_neighbor_requests.remove(&peer);
         if self.active_view.contains(&peer) {
             self.remove_active(&peer, RemovalReason::ConnectionClosed, io);
@@ -378,6 +385,17 @@ where
     }
 
     fn on_join(&mut self, peer: PI, data: Option<PeerData>, io: &mut impl IO<PI>) {
+        debug!(
+            target: "rg3",
+            me = ?self.me, from = ?peer,
+            in_active = self.active_view.contains(&peer),
+            in_passive = self.passive_view.contains(&peer),
+            pending_neighbor = self.pending_neighbor_requests.contains(&peer),
+            alive_disconnect = self.alive_disconnect_peers.contains(&peer),
+            active_len = self.active_view.len(),
+            active_cap = self.config.active_view_capacity,
+            "rg3 on_join"
+        );
         // "A node that receives a join request will start by adding the new
         // node to its active view, even if it has to drop a random node from it. (6)"
         self.add_active(peer, data.clone(), Priority::High, true, io);
@@ -448,6 +466,19 @@ where
     }
 
     fn on_neighbor(&mut self, from: PI, details: Neighbor, io: &mut impl IO<PI>) {
+        let was_pending = self.pending_neighbor_requests.contains(&from);
+        debug!(
+            target: "rg3",
+            me = ?self.me, from = ?from,
+            priority = ?details.priority,
+            in_active = self.active_view.contains(&from),
+            in_passive = self.passive_view.contains(&from),
+            pending_neighbor = was_pending,
+            alive_disconnect = self.alive_disconnect_peers.contains(&from),
+            active_len = self.active_view.len(),
+            active_cap = self.config.active_view_capacity,
+            "rg3 on_neighbor (is_reply = pending_neighbor)"
+        );
         let is_reply = self.pending_neighbor_requests.remove(&from);
         let do_reply = !is_reply;
         // "A node q that receives a high priority neighbor request will always accept the request, even
@@ -634,6 +665,12 @@ where
     }
 
     fn handle_pending_neighbor_timer(&mut self, peer: PI, io: &mut impl IO<PI>) {
+        debug!(
+            target: "rg3",
+            me = ?self.me, peer = ?peer,
+            pending_neighbor = self.pending_neighbor_requests.contains(&peer),
+            "rg3 pending_neighbor_timer"
+        );
         if self.pending_neighbor_requests.remove(&peer) {
             self.passive_view.remove(&peer);
             // Clear metadata and eviction markers to prevent memory leaks on neighbor handshake timeout
@@ -753,6 +790,15 @@ where
     }
 
     fn send_neighbor(&mut self, peer: PI, priority: Priority, io: &mut impl IO<PI>) {
+        let already_pending = self.pending_neighbor_requests.contains(&peer);
+        debug!(
+            target: "rg3",
+            me = ?self.me, to = ?peer, priority = ?priority,
+            in_active = self.active_view.contains(&peer),
+            pending_neighbor = already_pending,
+            queued = !already_pending,
+            "rg3 send_neighbor"
+        );
         if self.pending_neighbor_requests.insert(peer) {
             let message = Message::Neighbor(Neighbor {
                 priority,
