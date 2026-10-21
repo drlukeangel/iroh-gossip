@@ -35,6 +35,11 @@ impl MessageId {
     pub fn from_content(message: &[u8]) -> Self {
         Self::from(blake3::hash(message))
     }
+
+    /// Returns the first 5 bytes as hex, a short form for logs.
+    pub fn fmt_short(&self) -> String {
+        data_encoding::HEXLOWER.encode(&self.as_bytes()[..5])
+    }
 }
 
 /// Events Plumtree is informed of from the peer sampling service and IO layer.
@@ -127,6 +132,7 @@ impl<PI> GossipEvent<PI> {
 pub struct Round(u16);
 
 impl Round {
+    /// Returns the round to forward a message with, one hop higher.
     pub fn next(&self) -> Round {
         Round(self.0 + 1)
     }
@@ -185,6 +191,28 @@ impl DeliveryScope {
     pub fn is_direct(&self) -> bool {
         matches!(self, Self::Neighbors | Self::Swarm(Round(0)))
     }
+}
+
+/// Returns the largest encoded size of a [`Message::Gossip`] with `content_len` bytes of content.
+///
+/// Each hop counts the round of a broadcast to the swarm one up, so its encoding
+/// grows on the way. This assumes the largest round.
+pub(crate) fn max_gossip_size(content_len: usize, scope: Scope) -> usize {
+    let scope = match scope {
+        Scope::Swarm => DeliveryScope::Swarm(Round(u16::MAX)),
+        Scope::Neighbors => DeliveryScope::Neighbors,
+    };
+    let empty = Message::Gossip(Gossip {
+        id: MessageId([0; 32]),
+        content: Bytes::new(),
+        scope,
+    });
+    let empty_size = postcard::experimental::serialized_size(&empty).expect("encodes");
+    // The content adds its bytes, and its length prefix grows from one byte.
+    let prefix_size = (usize::BITS - content_len.leading_zeros())
+        .div_ceil(7)
+        .max(1) as usize;
+    empty_size - 1 + prefix_size + content_len
 }
 
 /// The broadcast scope of a gossip message.
@@ -340,7 +368,10 @@ pub struct Stats {
     ///
     /// See [`Message::Prune`], [`Message::Graft`], [`Message::IHave`].
     pub control_messages_received: u64,
-    /// Max round seen so far.
+    /// Most hops that a message took to reach us, counting the link it came over.
+    ///
+    /// A message from its source took one hop. Plumtree 2.3 calls the largest
+    /// value over all recipients the last delivery hop.
     pub max_last_delivery_hop: u16,
 }
 
@@ -421,6 +452,33 @@ impl<PI: PeerIdentity> State<PI> {
                 Timer::EvictCache => self.on_evict_cache_timer(now, io),
             },
         }
+
+        #[cfg(test)]
+        self.check_invariants();
+    }
+
+    /// Panics if the per-peer bookkeeping disagrees with the peer sets.
+    ///
+    /// Runs after every event in the unit tests. Announcers in
+    /// `missing_messages` may be peers we do not hold yet: views converge in
+    /// their own time, and a graft makes them eager.
+    #[cfg(test)]
+    fn check_invariants(&self) {
+        for peer in self.eager_push_peers.iter() {
+            assert!(
+                !self.lazy_push_peers.contains(peer),
+                "{peer:?} is both eager and lazy"
+            );
+        }
+        for peer in self.lazy_push_queue.keys() {
+            assert!(
+                self.lazy_push_peers.contains(peer) || self.eager_push_peers.contains(peer),
+                "announcements queued for {peer:?}, which is no peer"
+            );
+        }
+        for (id, ihaves) in self.missing_messages.iter() {
+            assert!(!ihaves.is_empty(), "no announcer left for missing {id:?}");
+        }
     }
 
     /// Get access to the [`Stats`] of the plumtree.
@@ -435,8 +493,13 @@ impl<PI: PeerIdentity> State<PI> {
         } else {
             self.stats.control_messages_received += 1;
         }
+        // A message from a non-neighbor is a straggler from a former one. Deliver
+        // its payload, but let it change no peer set.
+        let from_peer =
+            self.eager_push_peers.contains(&sender) || self.lazy_push_peers.contains(&sender);
         match message {
-            Message::Gossip(details) => self.on_gossip(sender, details, now, io),
+            Message::Gossip(details) => self.on_gossip(sender, from_peer, details, now, io),
+            _ if !from_peer => {}
             Message::Prune => self.on_prune(sender),
             Message::IHave(details) => self.on_ihave(sender, details, io),
             Message::Graft(details) => self.on_graft(sender, details, io),
@@ -448,8 +511,8 @@ impl<PI: PeerIdentity> State<PI> {
         let chunk_size = self.max_message_size
             // Space for discriminator
             - 1
-            // Space for length prefix
-            - 2;
+            // Space for the length of the list: 5 bytes hold any length that fits a frame
+            - 5;
         let chunk_len = chunk_size / IHave::POSTCARD_MAX_SIZE;
         while let Some((peer, list)) = self.lazy_push_queue.pop_first() {
             for chunk in list.chunks(chunk_len) {
@@ -465,6 +528,12 @@ impl<PI: PeerIdentity> State<PI> {
     /// Will be pushed in full to eager peers.
     /// Pushing the message id to the lazy peers is delayed by a timer.
     fn broadcast(&mut self, content: Bytes, scope: Scope, now: Instant, io: &mut impl IO<PI>) {
+        // A message over the limit, at any hop, cannot go out, so we neither cache
+        // nor announce it.
+        if max_gossip_size(content.len(), scope) > self.max_message_size {
+            warn!(max = self.max_message_size, "broadcast too large, dropped");
+            return;
+        }
         let id = MessageId::from_content(&content);
         let scope = match scope {
             Scope::Neighbors => DeliveryScope::Neighbors,
@@ -487,7 +556,14 @@ impl<PI: PeerIdentity> State<PI> {
     }
 
     /// Handle receiving a [`Message::Gossip`].
-    fn on_gossip(&mut self, sender: PI, message: Gossip, now: Instant, io: &mut impl IO<PI>) {
+    fn on_gossip(
+        &mut self,
+        sender: PI,
+        from_peer: bool,
+        message: Gossip,
+        now: Instant,
+        io: &mut impl IO<PI>,
+    ) {
         // Validate that the message id is the blake3 hash of the message content.
         if !message.validate() {
             // TODO: Do we want to take any measures against the sender if we received a message
@@ -502,7 +578,12 @@ impl<PI: PeerIdentity> State<PI> {
         // if we already received this message: move peer to lazy set
         // and notify peer about this.
         if self.received_messages.contains_key(&message.id) {
-            self.add_lazy(sender);
+            debug!(hash = %message.id.fmt_short(), "Received duplicate message... ignoring");
+            if from_peer {
+                self.add_lazy(sender);
+            }
+            // A non-neighbor that pushes to us may still hold us as an eager
+            // peer, as an older version does. The `Prune` stops its pushes.
             io.push(OutEvent::SendMessage(sender, Message::Prune));
         // otherwise store the message, emit to application and forward to peers
         } else {
@@ -530,11 +611,13 @@ impl<PI: PeerIdentity> State<PI> {
                 self.graft_timer_scheduled.remove(&message.id);
                 let previous_ihaves = self.missing_messages.remove(&message.id);
                 // do the optimization step from the paper
-                if let Some(previous_ihaves) = previous_ihaves {
+                if let Some(previous_ihaves) = previous_ihaves.filter(|_| from_peer) {
                     self.optimize_tree(&sender, &message, previous_ihaves, io);
                 }
-                self.stats.max_last_delivery_hop =
-                    self.stats.max_last_delivery_hop.max(prev_round.0);
+                self.stats.max_last_delivery_hop = self
+                    .stats
+                    .max_last_delivery_hop
+                    .max(prev_round.0.saturating_add(1));
             }
 
             // emit event to application
@@ -626,6 +709,13 @@ impl<PI: PeerIdentity> State<PI> {
             .missing_messages
             .get_mut(&id)
             .and_then(|entries| entries.pop_front());
+        if self
+            .missing_messages
+            .get(&id)
+            .is_some_and(VecDeque::is_empty)
+        {
+            self.missing_messages.remove(&id);
+        }
         if let Some((peer, round)) = entry {
             self.add_eager(peer);
             let message = Message::Graft(Graft {
@@ -676,7 +766,8 @@ impl<PI: PeerIdentity> State<PI> {
         });
         self.eager_push_peers.remove(&peer);
         self.lazy_push_peers.remove(&peer);
-        // Clear the lazy push queue to prevent lingering peer IDs from leaking memory when a neighbor goes down
+        // The dispatch timer would otherwise send these, and the network layer
+        // would dial the peer to deliver them.
         self.lazy_push_queue.remove(&peer);
     }
 
@@ -740,27 +831,234 @@ impl<PI: PeerIdentity> State<PI> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::proto::topic;
 
-    /// Regression for n0-computer/iroh-gossip#146: a downed neighbor must be
-    /// dropped from `lazy_push_queue`, not just from the eager/lazy peer sets.
-    /// Without the prune the queued IHaves linger, leaking one entry per
-    /// rotated neighbor under churn.
+    /// A control frame already in flight when a neighbor leaves must not add
+    /// that peer back to the broadcast view without a membership handshake.
     #[test]
-    fn neighbor_down_prunes_lazy_push_queue() {
+    fn late_prune_does_not_recreate_a_departed_peer() {
         let mut state = State::new(1u32, Config::default(), 1024);
-        let peer = 2u32;
-        // Seed a queued lazy-push IHave for the peer.
-        state.lazy_push_queue.entry(peer).or_default().push(IHave {
-            id: MessageId::from_content(b"x"),
-            round: Round(1),
-        });
-        assert!(state.lazy_push_queue.contains_key(&peer));
+        let now = Instant::now();
+        let mut io = VecDeque::new();
+        state.handle(InEvent::NeighborUp(2), now, &mut io);
+        state.handle(InEvent::NeighborDown(2), now, &mut io);
+        state.handle(InEvent::RecvMessage(2, Message::Prune), now, &mut io);
+        assert!(!state.eager_push_peers.contains(&2));
+        assert!(!state.lazy_push_peers.contains(&2));
+    }
 
-        state.on_neighbor_down(peer);
+    /// Returns a swarm-scope payload with `content`, as received after `round` hops.
+    fn gossip(content: &'static [u8], round: u16) -> Gossip {
+        let content = Bytes::from_static(content);
+        Gossip {
+            id: MessageId::from_content(&content),
+            content,
+            scope: DeliveryScope::Swarm(Round(round)),
+        }
+    }
 
+    /// Late frames of a departed neighbor change no peer set, and a reconnect restores it.
+    ///
+    /// A `Graft`, an `IHave`, or a duplicate payload can be in flight when the
+    /// membership layer drops a peer. Before, each of them put the peer back
+    /// into the eager or lazy set, and every later broadcast dialed it.
+    #[test]
+    fn late_frames_do_not_recreate_a_departed_peer() {
+        let mut state = State::new(1u32, Config::default(), 1024);
+        let now = Instant::now();
+        let mut io = VecDeque::new();
+        state.handle(InEvent::NeighborUp(2), now, &mut io);
+        state.handle(InEvent::NeighborUp(3), now, &mut io);
+        let seen = gossip(b"seen", 1);
+        state.handle(
+            InEvent::RecvMessage(3, Message::Gossip(seen.clone())),
+            now,
+            &mut io,
+        );
+        state.handle(InEvent::NeighborDown(2), now, &mut io);
+        let unknown = MessageId::from_content(b"unknown");
+        let late = [
+            Message::Graft(Graft {
+                id: Some(seen.id),
+                round: Round(1),
+            }),
+            Message::IHave(vec![IHave {
+                id: unknown,
+                round: Round(1),
+            }]),
+            Message::Gossip(seen),
+        ];
+        for message in late {
+            state.handle(InEvent::RecvMessage(2, message), now, &mut io);
+        }
+        assert!(!state.eager_push_peers.contains(&2));
+        assert!(!state.lazy_push_peers.contains(&2));
         assert!(
-            !state.lazy_push_queue.contains_key(&peer),
-            "on_neighbor_down must prune the peer from lazy_push_queue"
+            state.missing_messages.is_empty(),
+            "a non-neighbor's IHave was kept"
+        );
+
+        state.handle(InEvent::NeighborUp(2), now, &mut io);
+        assert!(
+            state.eager_push_peers.contains(&2),
+            "a reconnect must restore the peer"
+        );
+    }
+
+    /// A duplicate from a non-neighbor gets a `Prune`, and changes no peer set.
+    ///
+    /// An older node may still hold us as an eager peer after it dropped us. The
+    /// `Prune` stops it from pushing every message to us in full.
+    #[test]
+    fn duplicate_from_a_non_neighbor_is_pruned_but_not_added() {
+        let mut state = State::new(1u32, Config::default(), 1024);
+        let now = Instant::now();
+        let mut io = VecDeque::new();
+        let message = gossip(b"dup", 1);
+        state.handle(
+            InEvent::RecvMessage(2, Message::Gossip(message.clone())),
+            now,
+            &mut io,
+        );
+        assert!(
+            io.iter()
+                .any(|event| matches!(event, crate::proto::topic::OutEvent::EmitEvent(_))),
+            "a non-neighbor's first payload is delivered"
+        );
+        io.clear();
+        state.handle(
+            InEvent::RecvMessage(2, Message::Gossip(message)),
+            now,
+            &mut io,
+        );
+        assert!(io.iter().any(|event| matches!(
+            event,
+            crate::proto::topic::OutEvent::SendMessage(
+                2,
+                crate::proto::topic::Message::Gossip(Message::Prune)
+            )
+        )));
+        assert!(state.eager_push_peers.is_empty() && state.lazy_push_peers.is_empty());
+    }
+
+    /// A late payload from a non-neighbor does not optimize the tree toward it.
+    #[test]
+    fn late_payload_from_a_non_neighbor_does_not_optimize_the_tree() {
+        let mut state = State::new(1u32, Config::default(), 1024);
+        let now = Instant::now();
+        let mut io = VecDeque::new();
+        state.handle(InEvent::NeighborUp(3), now, &mut io);
+        let message = gossip(b"late payload", 100);
+        let ihave = Message::IHave(vec![IHave {
+            id: message.id,
+            round: Round(0),
+        }]);
+        state.handle(InEvent::RecvMessage(3, ihave), now, &mut io);
+        io.clear();
+        state.handle(
+            InEvent::RecvMessage(2, Message::Gossip(message)),
+            now,
+            &mut io,
+        );
+        assert!(!state.eager_push_peers.contains(&2) && !state.lazy_push_peers.contains(&2));
+        assert!(
+            !io.iter().any(|event| matches!(
+                event,
+                crate::proto::topic::OutEvent::SendMessage(
+                    2,
+                    crate::proto::topic::Message::Gossip(Message::Prune)
+                )
+            )),
+            "pruned a non-neighbor through the optimization: {io:?}"
+        );
+    }
+
+    /// Announcements queued for a neighbor that then goes down must not be sent.
+    #[test]
+    fn neighbor_down_drops_queued_ihaves() {
+        let mut io = VecDeque::new();
+        let mut state = State::new(1u32, Config::default(), 1024);
+        let now = Instant::now();
+
+        // Peer 2 joins and prunes us, which makes it a lazy peer, so broadcasting
+        // queues an IHave for it rather than sending the content.
+        state.handle(InEvent::NeighborUp(2), now, &mut io);
+        state.handle(InEvent::RecvMessage(2, Message::Prune), now, &mut io);
+        let content: Bytes = b"hi".to_vec().into();
+        state.handle(InEvent::Broadcast(content, Scope::Swarm), now, &mut io);
+        assert!(state.lazy_push_queue.contains_key(&2));
+
+        state.handle(InEvent::NeighborDown(2), now, &mut io);
+        io.clear();
+        state.handle(InEvent::TimerExpired(Timer::DispatchLazyPush), now, &mut io);
+
+        assert!(io.is_empty(), "sent to a peer that went down: {io:?}");
+    }
+
+    /// A message that missed the eager path reaches us through an `IHave` and a `Graft`.
+    ///
+    /// A lazy peer announces the message. When the graft timer fires, we ask
+    /// that peer for it with a `Graft`, and the peer becomes eager. The peer
+    /// answers the `Graft` with the message, and makes us eager too.
+    #[test]
+    fn missed_gossip_is_repaired_by_graft() {
+        let now = Instant::now();
+        let content: Bytes = b"repair".to_vec().into();
+        let id = MessageId::from_content(&content);
+
+        let mut sender = State::new(2u32, Config::default(), 1024);
+        let mut sender_io = VecDeque::new();
+        sender.handle(InEvent::NeighborUp(1), now, &mut sender_io);
+        sender.handle(InEvent::RecvMessage(1, Message::Prune), now, &mut sender_io);
+        sender.handle(
+            InEvent::Broadcast(content, Scope::Swarm),
+            now,
+            &mut sender_io,
+        );
+        sender_io.clear();
+
+        let mut receiver = State::new(1u32, Config::default(), 1024);
+        let mut io = VecDeque::new();
+        receiver.handle(InEvent::NeighborUp(2), now, &mut io);
+        receiver.handle(InEvent::RecvMessage(2, Message::Prune), now, &mut io);
+        let ihave = Message::IHave(vec![IHave {
+            id,
+            round: Round(1),
+        }]);
+        receiver.handle(InEvent::RecvMessage(2, ihave), now, &mut io);
+        io.clear();
+        receiver.handle(InEvent::TimerExpired(Timer::SendGraft(id)), now, &mut io);
+
+        let graft = io
+            .iter()
+            .find_map(|event| match event {
+                topic::OutEvent::SendMessage(2, topic::Message::Gossip(Message::Graft(graft))) => {
+                    Some(graft.clone())
+                }
+                _ => None,
+            })
+            .expect("no graft to the announcer");
+        assert!(
+            receiver.eager_push_peers.contains(&2),
+            "the announcer is not eager"
+        );
+
+        sender.handle(
+            InEvent::RecvMessage(1, Message::Graft(graft)),
+            now,
+            &mut sender_io,
+        );
+        let answered = sender_io.iter().any(|event| {
+            matches!(
+                event,
+                topic::OutEvent::SendMessage(1, topic::Message::Gossip(Message::Gossip(gossip)))
+                    if gossip.id == id
+            )
+        });
+        assert!(answered, "the graft was not answered: {sender_io:?}");
+        assert!(
+            sender.eager_push_peers.contains(&1),
+            "the grafting peer is not eager"
         );
     }
 
@@ -770,6 +1068,11 @@ mod test {
         let config: Config = Default::default();
         let mut state = State::new(1, config.clone(), 1024);
         let now = Instant::now();
+        // Peers 2 and 3 are neighbors, and 2 pruned us, so it is lazy.
+        state.handle(InEvent::NeighborUp(2), now, &mut io);
+        state.handle(InEvent::NeighborUp(3), now, &mut io);
+        state.handle(InEvent::RecvMessage(2, Message::Prune), now, &mut io);
+        io.clear();
 
         // we receive an IHave message from peer 2
         // it has `round: 2` which means that the the peer that sent us the IHave was
@@ -932,5 +1235,102 @@ mod test {
         let now = now + config.message_cache_retention;
         state.handle(InEvent::TimerExpired(Timer::EvictCache), now, &mut io);
         assert_eq!(state.cache.len(), 0);
+    }
+
+    /// A missing message leaves no entry once we asked its last announcer.
+    #[test]
+    fn last_graft_leaves_no_missing_entry() {
+        let mut io = VecDeque::new();
+        let mut state = State::new(1u32, Config::default(), 1024);
+        let now = Instant::now();
+        state.handle(InEvent::NeighborUp(2), now, &mut io);
+        let id = MessageId::from_content(b"hi");
+        let ihave = Message::IHave(vec![IHave {
+            id,
+            round: Round(1),
+        }]);
+        state.handle(InEvent::RecvMessage(2, ihave), now, &mut io);
+
+        state.handle(InEvent::TimerExpired(Timer::SendGraft(id)), now, &mut io);
+
+        assert!(state.missing_messages.is_empty());
+    }
+
+    /// A batch of announcements fits the size limit, also when its length takes 3 bytes.
+    ///
+    /// A list of 16384 entries or more has a length of 3 bytes, and an announcement
+    /// of a round of 16384 or more takes 35 bytes.
+    #[test]
+    fn announcement_batch_fits_the_size_limit() {
+        let max_message_size = 16_384 * IHave::POSTCARD_MAX_SIZE + 3;
+        let mut state = State::new(1u32, Config::default(), max_message_size);
+        let now = Instant::now();
+        let mut io = VecDeque::new();
+        state.handle(InEvent::NeighborUp(2), now, &mut io);
+        let ihaves = (0..20_000u32).map(|i| IHave {
+            id: MessageId::from_content(&i.to_be_bytes()),
+            round: Round(20_000),
+        });
+        state.lazy_push_queue.insert(2, ihaves.collect());
+        io.clear();
+        state.handle(InEvent::TimerExpired(Timer::DispatchLazyPush), now, &mut io);
+
+        let mut sent = 0;
+        for event in io {
+            if let topic::OutEvent::SendMessage(2, topic::Message::Gossip(message)) = event {
+                let size = postcard::experimental::serialized_size(&message).expect("encodes");
+                assert!(size <= max_message_size, "{size} > {max_message_size}");
+                sent += 1;
+            }
+        }
+        assert!(sent >= 2, "the batch was not split");
+    }
+
+    /// `max_gossip_size` is the size at the largest round, and no less at any other.
+    #[test]
+    fn max_gossip_size_covers_every_round() {
+        let size = |content: &Bytes, scope| {
+            let message = Message::Gossip(Gossip {
+                id: MessageId::from_content(content),
+                content: content.clone(),
+                scope,
+            });
+            postcard::experimental::serialized_size(&message).expect("encodes")
+        };
+        for len in [0, 127, 128, 4000, 20_000] {
+            let content = Bytes::from(vec![0; len]);
+            let max = max_gossip_size(len, Scope::Swarm);
+            for round in [0, 127, 128, 16_383, 16_384] {
+                assert!(size(&content, DeliveryScope::Swarm(Round(round))) <= max);
+            }
+            assert_eq!(size(&content, DeliveryScope::Swarm(Round(u16::MAX))), max);
+            assert_eq!(
+                size(&content, DeliveryScope::Neighbors),
+                max_gossip_size(len, Scope::Neighbors)
+            );
+        }
+    }
+
+    /// Regression for n0-computer/iroh-gossip#146: a downed neighbor must be
+    /// dropped from `lazy_push_queue`, not just from the eager/lazy peer sets.
+    /// Without the prune the queued IHaves linger, leaking one entry per
+    /// rotated neighbor under churn.
+    #[test]
+    fn neighbor_down_prunes_lazy_push_queue() {
+        let mut state = State::new(1u32, Config::default(), 1024);
+        let peer = 2u32;
+        // Seed a queued lazy-push IHave for the peer.
+        state.lazy_push_queue.entry(peer).or_default().push(IHave {
+            id: MessageId::from_content(b"x"),
+            round: Round(1),
+        });
+        assert!(state.lazy_push_queue.contains_key(&peer));
+
+        state.on_neighbor_down(peer);
+
+        assert!(
+            !state.lazy_push_queue.contains_key(&peer),
+            "on_neighbor_down must prune the peer from lazy_push_queue"
+        );
     }
 }
