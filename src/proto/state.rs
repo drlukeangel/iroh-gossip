@@ -484,9 +484,9 @@ fn track_in_event<PI: Serialize>(event: &InEvent<PI>, metrics: &Metrics) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
     use n0_future::time::Instant;
     use rand::{rngs::StdRng, SeedableRng};
+    use std::collections::HashSet;
 
     use super::*;
     use crate::proto::{hyparview, plumtree};

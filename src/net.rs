@@ -2965,49 +2965,6 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// A control overflow during a handover closes the stuck old connection, not the new one (a cost of the design).
-    ///
-    /// The old connection does not read, so its writer keeps the queue for up
-    /// to the handover limit, and control fills the queue meanwhile. Today the
-    /// overflow aborts the peer, and closes the new and healthy connection too.
-    #[tokio::test(flavor = "current_thread")]
-    #[traced_test]
-    #[ignore = "a cost of the design, see SendQueue"]
-    async fn overflow_during_a_handover_keeps_the_new_connection() -> Result {
-        let pair = TestPair::new(1).await?;
-        let (old, peer_old) = pair.connect_back().await?;
-        let (new, peer_new) = pair.connect_back().await?;
-        let peer = pair.ep2.id();
-        let topic: TopicId = blake3::hash(b"overflow during a handover").into();
-        let mut actor = t_actor().await?;
-        actor.send_queue_size = 8 << 20;
-        actor.handle_connection(old);
-        for _ in 0..1000 {
-            let message = ProtoMessage {
-                topic,
-                message: TopicMessage::test_gossip(3000),
-            };
-            push_active(&actor, peer, message);
-        }
-        // Wait until flow control blocks the old writer.
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        actor.handle_connection(new);
-
-        // Large joins fill the queue before a writer runs again: nothing awaits.
-        let data = PeerData::new(vec![0u8; 2000]);
-        actor.handle_in_event(InEvent::UpdatePeerData(data), Instant::now());
-        join_until_full(&mut actor, peer);
-        assert_eq!(actor.metrics.peers_send_queue_full.get(), 1, "no overflow");
-        timeout(Duration::from_secs(2), peer_old.closed())
-            .await
-            .std_context("the stuck old connection stayed open")?;
-        assert!(
-            peer_new.close_reason().is_none(),
-            "the new connection closed"
-        );
-        Ok(())
-    }
-
     /// A peer whose queue fills during the dial goes down, and its queue with it.
     #[tokio::test]
     #[traced_test]
@@ -5876,16 +5833,10 @@ pub(crate) mod tests {
         Err(n0_error::anyerr!("the subscription ended"))
     }
 
-    /// A healthy peer that shares more topics with us than its stream limit keeps its neighbors (a cost of the design).
-    ///
-    /// v1 keeps a stream per topic open while the topic uses the peer. Over the
-    /// peer's limit of concurrent streams, the open of the next stream waits for
-    /// good, and the open timeout closes the connection. The topics rejoin, and
-    /// it closes again. The limit of iroh is 100 streams by default.
-    #[tokio::test(flavor = "multi_thread")]
-    #[traced_test]
-    #[ignore = "a cost of the design: one stream per topic, see SendQueue"]
-    async fn topics_over_the_stream_limit_keep_their_neighbors() -> Result {
+    /// Runs two nodes whose connections allow four uni streams, sharing `count` topics, past the
+    /// open timeout of a stream over the limit. Returns whether every topic joined, and how many
+    /// neighbors went down.
+    async fn sharing_topics(count: u32) -> Result<(bool, u64)> {
         let lookup = MemoryLookup::new();
         let limited = || {
             QuicTransportConfig::builder()
@@ -5895,7 +5846,7 @@ pub(crate) mod tests {
         let a = DirectNode::spawn(&lookup, Gossip::builder(), limited()).await?;
         let b = DirectNode::spawn(&lookup, Gossip::builder(), limited()).await?;
         let mut topics = Vec::new();
-        for i in 0..8u32 {
+        for i in 0..count {
             let topic: TopicId = blake3::hash(&i.to_be_bytes()).into();
             topics.push(a.gossip.subscribe(topic, vec![]).await?);
             topics.push(b.gossip.subscribe(topic, vec![a.id()]).await?);
@@ -5906,13 +5857,36 @@ pub(crate) mod tests {
             }
             Ok::<_, AnyError>(())
         };
-        timeout(PROMPT, joined)
-            .await
-            .std_context("the topics did not join")??;
-        // Long enough for the open timeout of a stream over the limit.
+        let all_joined = matches!(timeout(PROMPT, joined).await, Ok(Ok(())));
         tokio::time::sleep(util::OPEN_TIMEOUT + Duration::from_secs(2)).await;
         let down = a.gossip.metrics().neighbor_down.get() + b.gossip.metrics().neighbor_down.get();
-        assert_eq!(down, 0, "neighbors went down");
+        Ok((all_joined, down))
+    }
+
+    /// Topics up to the peer's limit of concurrent streams join and keep their neighbors.
+    #[tokio::test(flavor = "multi_thread")]
+    #[traced_test]
+    async fn topics_within_the_stream_limit_keep_their_neighbors() -> Result {
+        let (all_joined, down) = sharing_topics(4).await?;
+        assert!(all_joined, "the topics did not join within the limit");
+        assert_eq!(down, 0, "neighbors went down within the limit");
+        Ok(())
+    }
+
+    /// Topics over the peer's limit of concurrent streams do not all join, and lose their neighbors
+    /// (a known limit).
+    ///
+    /// v1 keeps a stream per topic open while the topic uses the peer. Over the peer's limit, the
+    /// open of the next stream waits for good, the open timeout closes the connection, the topics
+    /// rejoin, and it closes again. The limit of iroh is 100 streams by default. Only one stream
+    /// per connection, a wire change, removes the limit. This states what happens today (RDM Q384),
+    /// so a change in it is seen.
+    #[tokio::test(flavor = "multi_thread")]
+    #[traced_test]
+    async fn topics_over_the_stream_limit_do_not_join_and_lose_their_neighbors() -> Result {
+        let (all_joined, down) = sharing_topics(8).await?;
+        assert!(!all_joined, "every topic joined over the limit");
+        assert!(down > 0, "no neighbor went down over the limit");
         Ok(())
     }
 

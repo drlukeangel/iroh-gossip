@@ -1402,17 +1402,17 @@ mod tests {
         panic!("the two sides kept answering each other");
     }
 
-    /// A `Disconnect` that arrives after the peer joined again removes the new neighbor (known bug).
+    /// A `Disconnect` that arrives after the peer joined again removes the new neighbor (a known defect).
     ///
     /// The peer drops us and joins again. The network delivers its `Join`
     /// before its `Disconnect`: v1 sends them on different streams, maybe on
     /// different connections, and the receiver reads each stream on its own. The
-    /// `Disconnect` then ends the new membership, and the two views differ until
+    /// `Disconnect` then ends the new neighbor, and the two views differ until
     /// a later message changes them. Only a wire change can fix it, for example
-    /// a membership epoch that a `Disconnect` names.
+    /// a generation number that a `Disconnect` names. This states what happens
+    /// today (RDM Q384), so a change in it is seen.
     #[test]
-    #[ignore = "a cost of the v1 wire, see SendQueue"]
-    fn late_disconnect_keeps_a_rejoined_neighbor() {
+    fn late_disconnect_leaves_a_rejoined_neighbor_apart() {
         let mut contact = new_state();
         let mut joiner = State::new(1, None, Config::default(), StdRng::seed_from_u64(2));
         let io = &mut Io::new();
@@ -1439,10 +1439,13 @@ mod tests {
         for message in late {
             contact.handle(InEvent::RecvMessage(1, message), io);
         }
-        assert_eq!(
-            contact.active_view.contains(&1),
+        assert!(
             joiner.active_view.contains(&0),
-            "the late Disconnect left the views apart"
+            "the joiner dropped its new neighbor"
+        );
+        assert!(
+            !contact.active_view.contains(&1),
+            "the late Disconnect no longer removes the new neighbor: the defect is gone, rename this"
         );
     }
 
