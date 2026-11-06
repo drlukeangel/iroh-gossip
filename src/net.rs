@@ -6224,6 +6224,185 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// A [`SendLoop`] whose connection was superseded ends, though the connection stays open.
+    ///
+    /// Moved from `send_loop_terminates_when_send_channel_closed`: the writer's send channel is now
+    /// a queue lease, and a new lease revokes the old one. A writer that kept waiting on
+    /// `conn.closed()` would live until the peer closed the connection, which under keep-alive
+    /// never happens, leaking one connection per churned link.
+    ///
+    /// [`SendLoop`]: util::SendLoop
+    #[tokio::test]
+    #[traced_test]
+    async fn send_loop_terminates_when_its_queue_lease_is_revoked() -> Result {
+        let pair = TestPair::new(1).await?;
+        let (conn, peer_conn) = pair.connect().await?;
+        let mut queue = SendQueue::new(queue::MIN_QUEUE_SIZE);
+
+        // Superseded before it started.
+        let lease = queue.lease();
+        let _next = queue.lease();
+        let send = SendLoop::new(
+            conn.clone(),
+            lease,
+            TEST_FRAME_LIMIT,
+            unset_flag(),
+            Vec::new(),
+        );
+        timeout(Duration::from_secs(5), send.run())
+            .await
+            .std_context("a writer revoked before it started did not end")??;
+
+        // Superseded while it waits on an empty queue.
+        let lease = queue.lease();
+        let send = SendLoop::new(
+            conn.clone(),
+            lease,
+            TEST_FRAME_LIMIT,
+            unset_flag(),
+            Vec::new(),
+        );
+        let running = spawn(send.run());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !running.is_finished(),
+            "the writer ended with nothing to end it"
+        );
+        let _next = queue.lease();
+        timeout(Duration::from_secs(5), running)
+            .await
+            .std_context("a writer revoked while it waited did not end")?
+            .std_context("the writer panicked")??;
+
+        // Only the lease ended them: the peer still holds the connection open.
+        assert!(conn.close_reason().is_none(), "the connection closed");
+        assert!(peer_conn.close_reason().is_none(), "the peer closed");
+        peer_conn.close(0u32.into(), b"done");
+        Ok(())
+    }
+
+    /// A peer that stopped reading (its queue is full) never stops the net actor.
+    ///
+    /// One actor waiting on one peer's queue goes deaf on every topic, and two actors doing it to
+    /// each other deadlock (rafka i143.e4.s12). Moved from the 64-slot queue to the byte-bounded
+    /// one, which treats the two kinds of message differently, so both are tested: data that does
+    /// not fit is dropped and counted and the peer stays; a control message that does not fit closes
+    /// the peer. Either way the actor carries on and serves every other peer. `handle_in_event` is
+    /// not `async`, so a wait on the queue cannot compile.
+    #[tokio::test(flavor = "current_thread")]
+    #[traced_test]
+    async fn a_full_peer_send_queue_never_blocks_the_actor() -> Result {
+        let mut actor = t_actor().await?;
+        let now = Instant::now();
+        let stalled = SecretKey::generate().public();
+        let flooded: TopicId = [1; 32].into();
+        actor
+            .peers
+            .insert(stalled, open_peer(queue::MIN_QUEUE_SIZE));
+        actor.handle_in_event(InEvent::Command(flooded, ProtoCommand::Join(vec![])), now);
+        actor.handle_in_event(InEvent::RecvMessage(stalled, join_message(flooded, 0)), now);
+        assert!(
+            actor.state.has_active_peers(&flooded),
+            "the join made no neighbor"
+        );
+
+        // Data: fill what data may take of the queue, as a peer that stopped reading leaves it.
+        let state = actor.peers.get_mut(&stalled).expect("the peer");
+        let mut i = 0;
+        while matches!(state.send(numbered(flooded, i)), Pushed::Queued) {
+            i += 1;
+        }
+        assert!(i > 0, "nothing fit into the queue");
+        // The queue bounds bytes: this must be larger than the room the last 1 KB message left.
+        let broadcast = ProtoCommand::Broadcast(Bytes::from(vec![0u8; 3000]), Scope::Swarm);
+        actor.handle_in_event(InEvent::Command(flooded, broadcast), now);
+        assert_eq!(
+            actor.metrics.msgs_dropped.get(),
+            1,
+            "the dropped data was not counted"
+        );
+        assert_eq!(
+            actor.metrics.peers_send_queue_full.get(),
+            0,
+            "data closed the peer"
+        );
+        assert!(
+            actor.peers.contains_key(&stalled),
+            "dropped data removed the peer"
+        );
+
+        // The actor still serves another peer and topic.
+        let live = SecretKey::generate().public();
+        let other: TopicId = [2; 32].into();
+        actor.handle_in_event(InEvent::Command(other, ProtoCommand::Join(vec![live])), now);
+        assert!(
+            !actor.peers[&live].queue.is_empty(),
+            "the actor stopped after the data drop"
+        );
+
+        // Control: what does not fit closes the peer, and the actor still serves the next one.
+        join_until_full(&mut actor, stalled);
+        assert_eq!(
+            actor.metrics.peers_send_queue_full.get(),
+            1,
+            "no control message overflowed"
+        );
+        let next = SecretKey::generate().public();
+        let last: TopicId = [3; 32].into();
+        actor.handle_in_event(InEvent::Command(last, ProtoCommand::Join(vec![next])), now);
+        assert!(
+            !actor.peers[&next].queue.is_empty(),
+            "the actor stopped after the overflow"
+        );
+        Ok(())
+    }
+
+    /// A peer whose connection task ended keeps its existing handling.
+    ///
+    /// Moved from the closed `mpsc` queue: a send to it is neither waited on nor counted as a
+    /// full-queue drop, and the peer is not removed inline. The message waits in the peer's queue
+    /// for its next connection; the peer's removal stays with the connection task's finish
+    /// (`handle_connection_task_finished`, exercised end to end by the reconnect tests).
+    #[tokio::test(flavor = "current_thread")]
+    #[traced_test]
+    async fn a_closed_peer_send_queue_keeps_its_disconnect_cleanup() -> Result {
+        let mut actor = t_actor().await?;
+        let now = Instant::now();
+        let gone = SecretKey::generate().public();
+        let mut state = open_peer(queue::QUEUE_SIZE);
+        let _lease = state
+            .handle_connection(Side::Server, 1)
+            .expect("an accepted connection takes the lease");
+        assert_eq!(
+            state.connection_finished(1, now, false),
+            Finished::Disconnected
+        );
+        actor.peers.insert(gone, state);
+
+        let topic: TopicId = [4; 32].into();
+        actor.handle_in_event(InEvent::Command(topic, ProtoCommand::Join(vec![gone])), now);
+
+        assert_eq!(
+            actor.metrics.msgs_dropped.get(),
+            0,
+            "counted as a dropped message"
+        );
+        assert_eq!(
+            actor.metrics.peers_send_queue_full.get(),
+            0,
+            "counted as an overflow"
+        );
+        assert!(
+            actor.peers.contains_key(&gone),
+            "the peer was removed inline"
+        );
+        assert!(
+            !actor.peers[&gone].queue.is_empty(),
+            "the message did not wait for a connection"
+        );
+        Ok(())
+    }
+
     /// Two actors flooding each other on one topic saturate each other's
     /// per-peer send queues. Neither may go deaf: each keeps taking commands
     /// for the whole flood, each hears a third peer's messages on another
