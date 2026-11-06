@@ -13,7 +13,14 @@ resolver = "2"
 rust-version = "1.91"
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+# RAFKA LOCAL DIVERGENCE (2026-09-05, Luke ruling) — DROP THIS WHEN RETURNING TO UPSTREAM.
+# Upstream declares `crate-type = ["cdylib", "rlib"]` for wasm32 builds. rafka never builds
+# wasm32 and links only the rlib half (node gossip is compiled statically into every node
+# binary: ldd shows 0 iroh shared objects, nm shows the iroh_gossip symbols inside). The
+# cdylib half costs a dynamic link per build and makes sccache refuse the compile
+# ("Non-cacheable reasons: crate-type"). No symbol, API or runtime behaviour changes.
+# upstream: crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [lints.rust]
 missing_debug_implementations = "warn"
@@ -47,7 +54,7 @@ derive_more = { version = "2.0.1", features = [
 hex = "0.4.3"
 indexmap = "2.0"
 iroh-metrics = { version = "1.0.1", default-features = false }
-iroh-base = { version = "1", default-features = false, features = ["key"] }
+iroh-base = { git = "https://github.com/drlukeangel/iroh", rev = "938633e5b5db478d33d5991fdb8453726e6b4221", version = "1", default-features = false, features = ["key"] }
 n0-future = "0.3"
 postcard = { version = "1", default-features = false, features = [
     "alloc",
@@ -59,7 +66,7 @@ rustc-hash = "2.1"
 serde = { version = "1.0.164", features = ["derive"] }
 
 # net dependencies (optional)
-iroh = { version = "1", default-features = false, optional = true }
+iroh = { git = "https://github.com/drlukeangel/iroh", rev = "938633e5b5db478d33d5991fdb8453726e6b4221", version = "1", default-features = false, optional = true }
 tokio = { version = "1", optional = true, features = ["io-util", "sync"] }
 tokio-util = { version = "0.7.12", optional = true, features = ["codec"] }
 tracing = "0.1"
@@ -71,7 +78,7 @@ irpc = { version = "0.17.0", optional = true, default-features = false, features
 n0-error = { version = "1", features = ["anyhow"] }
 
 # rpc dependencies (optional)
-noq = { version = "1", optional = true, default-features = false }
+noq = { git = "https://github.com/drlukeangel/noq", rev = "9de1796d688d548079bb09e1741193930f234314", version = "1", optional = true, default-features = false }
 
 # test-utils dependencies (optional)
 humantime-serde = { version = "1.1.1", optional = true }
@@ -100,7 +107,7 @@ tokio = { version = "1", features = [
 clap = { version = "4", features = ["derive"] }
 futures-concurrency = "7.6.1"
 humantime-serde = { version = "1.1.1" }
-iroh = { version = "1", default-features = false, features = [
+iroh = { git = "https://github.com/drlukeangel/iroh", rev = "938633e5b5db478d33d5991fdb8453726e6b4221", version = "1", default-features = false, features = [
     "metrics",
     "test-utils",
     "tls-ring"

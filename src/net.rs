@@ -6223,4 +6223,205 @@ pub(crate) mod tests {
         assert_eq!(received, sent);
         Ok(())
     }
+
+    /// Two actors flooding each other on one topic saturate each other's
+    /// per-peer send queues. Neither may go deaf: each keeps taking commands
+    /// for the whole flood, each hears a third peer's messages on another
+    /// topic again right after it, and one message sent once on the flooded
+    /// topic still converges (ordinary delivery or Plumtree repair through the
+    /// third peer; nothing resends). Deafness is permanent: with the blocking
+    /// send the actors stop taking commands within about a second.
+    ///
+    /// The flood runs with tracing off on every runtime thread: a TRACE
+    /// subscriber that another test installed globally would otherwise
+    /// serialize the actors on logging and time out the probes.
+    #[test]
+    fn reciprocal_send_queue_saturation_never_makes_both_actors_deaf() {
+        let quiet = || {
+            std::mem::forget(tracing::subscriber::set_default(
+                tracing::subscriber::NoSubscriber::default(),
+            ))
+        };
+        quiet();
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .on_thread_start(quiet)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(reciprocal_flood());
+    }
+
+    async fn reciprocal_flood() {
+        let mut rng = rand::rngs::ChaCha12Rng::seed_from_u64(11);
+        let (relay_map, relay_url, _guard) = iroh::test_utils::run_relay_server().await.unwrap();
+        let lookup = MemoryLookup::new();
+        let mut eps = Vec::new();
+        for _ in 0..3 {
+            eps.push(
+                create_endpoint(&mut rng, relay_map.clone(), Some(lookup.clone()))
+                    .await
+                    .unwrap(),
+            );
+        }
+        for ep in &eps {
+            lookup.add_endpoint_info(EndpointAddr::new(ep.id()).with_relay_url(relay_url.clone()));
+        }
+        let gs: Vec<Gossip> = eps
+            .iter()
+            .map(|ep| Gossip::builder().spawn(ep.clone()))
+            .collect();
+        let cancel = CancellationToken::new();
+        let _loops: Vec<_> = eps
+            .iter()
+            .zip(&gs)
+            .map(|(ep, g)| spawn(endpoint_loop(ep.clone(), g.clone(), cancel.clone())))
+            .collect();
+        let (a, b, c) = (eps[0].id(), eps[1].id(), eps[2].id());
+        let t1: TopicId = blake3::hash(b"flood").into();
+        let t2: TopicId = blake3::hash(b"probe-a").into();
+        let t3: TopicId = blake3::hash(b"probe-b").into();
+
+        let [a1, b1, c1] = [
+            gs[0].subscribe_and_join(t1, vec![]),
+            gs[1].subscribe_and_join(t1, vec![a]),
+            gs[2].subscribe_and_join(t1, vec![a, b]),
+        ]
+        .try_join()
+        .await
+        .unwrap();
+        let [a2, c2] = [
+            gs[0].subscribe_and_join(t2, vec![]),
+            gs[2].subscribe_and_join(t2, vec![a]),
+        ]
+        .try_join()
+        .await
+        .unwrap();
+        let [b3, c3] = [
+            gs[1].subscribe_and_join(t3, vec![]),
+            gs[2].subscribe_and_join(t3, vec![b]),
+        ]
+        .try_join()
+        .await
+        .unwrap();
+
+        // Every subscription is drained, so only the net actors can stall.
+        let (a1_tx, a1_rx) = a1.split();
+        let (b1_tx, mut b1_rx) = b1.split();
+        let (_c1_tx, c1_rx) = c1.split();
+        let probes_seen = |mut rx: GossipReceiver| {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::<Instant>::new()));
+            let s = seen.clone();
+            spawn(async move {
+                while let Some(Ok(ev)) = rx.next().await {
+                    if let Event::Received(_) = ev {
+                        s.lock().unwrap().push(Instant::now());
+                    }
+                }
+            });
+            seen
+        };
+        let drain = |mut rx: GossipReceiver| {
+            spawn(async move { while let Some(Ok(_)) = rx.next().await {} })
+        };
+        let _ = (drain(a1_rx), drain(c1_rx));
+        let (_a2_tx, a2_rx) = a2.split();
+        let (_b3_tx, b3_rx) = b3.split();
+        let (a_probes, b_probes) = (probes_seen(a2_rx), probes_seen(b3_rx));
+        let (c2_tx, _c2_rx) = c2.split();
+        let (c3_tx, _c3_rx) = c3.split();
+        let prober = spawn(async move {
+            for i in 0u64.. {
+                let _ = c2_tx
+                    .broadcast(format!("probe-a {i}").into_bytes().into())
+                    .await;
+                let _ = c3_tx
+                    .broadcast(format!("probe-b {i}").into_bytes().into())
+                    .await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+        let _ = c;
+
+        // Flood both ways at once.
+        let payload = Bytes::from(vec![7u8; 3000]);
+        let flood_for = Duration::from_secs(4);
+        let flood = |tx: GossipSender, payload: Bytes| {
+            spawn(async move {
+                let until = Instant::now() + flood_for;
+                let mut n = 0u64;
+                let mut stalled = false;
+                while Instant::now() < until {
+                    let mut m = payload.to_vec();
+                    m.extend_from_slice(&n.to_be_bytes());
+                    if timeout(Duration::from_secs(1), tx.broadcast(m.into()))
+                        .await
+                        .is_err()
+                    {
+                        // The local actor no longer takes commands.
+                        stalled = true;
+                        break;
+                    }
+                    n += 1;
+                }
+                (n, tx, stalled)
+            })
+        };
+        let (fa, fb) = (flood(a1_tx, payload.clone()), flood(b1_tx, payload));
+        let (fa, fb) = (fa.await.unwrap(), fb.await.unwrap());
+        assert!(
+            !fa.2,
+            "A's actor stopped taking commands after {} broadcasts",
+            fa.0
+        );
+        assert!(
+            !fb.2,
+            "B's actor stopped taking commands after {} broadcasts",
+            fb.0
+        );
+        // Deafness is permanent; lateness behind the flood is not deafness.
+        let flood_end = Instant::now();
+        let heard_after = |seen: Arc<std::sync::Mutex<Vec<Instant>>>| async move {
+            // The backlog of the flood (and of C's forwards) drains through
+            // one shared relay first; permanence is what this rules out.
+            timeout(Duration::from_secs(20), async {
+                loop {
+                    if seen.lock().unwrap().iter().any(|t| *t > flood_end) {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .is_ok()
+        };
+        assert!(
+            heard_after(a_probes).await,
+            "A is deaf after the flood ({} sent)",
+            fa.0
+        );
+        assert!(
+            heard_after(b_probes).await,
+            "B is deaf after the flood ({} sent)",
+            fb.0
+        );
+
+        // After the flood one marker, sent once, still reaches B.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        fa.1.broadcast(Bytes::from_static(b"marker")).await.unwrap();
+        let got = timeout(Duration::from_secs(15), async {
+            while let Some(Ok(ev)) = b1_rx.next().await {
+                if let Event::Received(m) = ev {
+                    if m.content.as_ref() == b"marker" {
+                        return true;
+                    }
+                }
+            }
+            false
+        })
+        .await;
+        assert_eq!(got, Ok(true), "the marker converged at B after the flood");
+        prober.abort();
+        cancel.cancel();
+    }
 }
