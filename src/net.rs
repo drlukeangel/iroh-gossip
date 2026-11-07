@@ -52,7 +52,7 @@ const TO_ACTOR_CAP: usize = 64;
 /// Channel capacity for the InEvent message queue (single)
 const IN_EVENT_CAP: usize = 1024;
 /// Channel capacity for broadcast subscriber event queue (one per topic)
-const TOPIC_EVENT_CAP: usize = 256;
+const TOPIC_EVENT_CAP: usize = 8192;
 
 /// How long a connection stays open once neither side has a stream on it.
 ///
